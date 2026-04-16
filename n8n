@@ -1,0 +1,207 @@
+{
+  "name": "Azure FinOps Pipeline (Cost + Advisor → Supabase)",
+  "nodes": [
+    {
+      "parameters": {
+        "triggerTimes": {
+          "item": [
+            {
+              "mode": "everyHour"
+            }
+          ]
+        }
+      },
+      "id": "Cron",
+      "name": "Cron",
+      "type": "n8n-nodes-base.cron",
+      "typeVersion": 1,
+      "position": [200, 300]
+    },
+    {
+      "parameters": {
+        "url": "https://login.microsoftonline.com/TENANT_ID/oauth2/token",
+        "method": "POST",
+        "bodyContentType": "form-urlencoded",
+        "bodyParametersUi": {
+          "parameter": [
+            { "name": "grant_type", "value": "client_credentials" },
+            { "name": "client_id", "value": "CLIENT_ID" },
+            { "name": "client_secret", "value": "CLIENT_SECRET" },
+            { "name": "resource", "value": "https://management.azure.com/" }
+          ]
+        }
+      },
+      "id": "GetToken",
+      "name": "Get Azure Token",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [400, 300]
+    },
+    {
+      "parameters": {
+        "url": "https://management.azure.com/subscriptions/SUBSCRIPTION_ID/providers/Microsoft.CostManagement/query?api-version=2023-03-01",
+        "method": "POST",
+        "jsonParameters": true,
+        "headerParametersUi": {
+          "parameter": [
+            {
+              "name": "Authorization",
+              "value": "Bearer {{$node[\"Get Azure Token\"].json[\"access_token\"]}}"
+            }
+          ]
+        },
+        "bodyParametersJson": "{\n  \"type\": \"ActualCost\",\n  \"timeframe\": \"MonthToDate\",\n  \"dataset\": {\n    \"granularity\": \"Daily\",\n    \"aggregation\": {\n      \"totalCost\": {\n        \"name\": \"Cost\",\n        \"function\": \"Sum\"\n      }\n    },\n    \"grouping\": [\n      { \"type\": \"Dimension\", \"name\": \"ResourceGroup\" },\n      { \"type\": \"Dimension\", \"name\": \"ServiceName\" }\n    ]\n  }\n}"
+      },
+      "id": "CostAPI",
+      "name": "Azure Cost API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [650, 150]
+    },
+    {
+      "parameters": {
+        "url": "https://management.azure.com/subscriptions/SUBSCRIPTION_ID/providers/Microsoft.Advisor/recommendations?api-version=2023-01-01",
+        "method": "GET",
+        "headerParametersUi": {
+          "parameter": [
+            {
+              "name": "Authorization",
+              "value": "Bearer {{$node[\"Get Azure Token\"].json[\"access_token\"]}}"
+            }
+          ]
+        }
+      },
+      "id": "AdvisorAPI",
+      "name": "Azure Advisor API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [650, 450]
+    },
+    {
+      "parameters": {
+        "mode": "mergeByIndex"
+      },
+      "id": "Merge",
+      "name": "Merge Data",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 2,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "const cost = $input.all()[0].json.properties?.rows || [];\nconst advisor = $input.all()[1].json.value || [];\n\nconst costData = cost.map(r => ({\n  type: 'cost',\n  date: r[0],\n  resource_group: r[1],\n  cost: r[2],\n  service: r[3]\n}));\n\nconst advisorData = advisor.map(r => ({\n  type: 'recommendation',\n  category: r.properties.category,\n  impact: r.properties.impact,\n  problem: r.properties.shortDescription?.problem,\n  solution: r.properties.shortDescription?.solution,\n  savings: r.properties.extendedProperties?.savingsAmount || null,\n  resource_id: r.properties.extendedProperties?.resourceId || null\n}));\n\nreturn [...costData, ...advisorData].map(i => ({ json: i }));"
+      },
+      "id": "Transform",
+      "name": "Transform Data",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 2,
+      "position": [1150, 300]
+    },
+    {
+      "parameters": {
+        "url": "https://SUPABASE_URL/rest/v1/finops_data",
+        "method": "POST",
+        "jsonParameters": true,
+        "headerParametersUi": {
+          "parameter": [
+            {
+              "name": "apikey",
+              "value": "SUPABASE_KEY"
+            },
+            {
+              "name": "Authorization",
+              "value": "Bearer SUPABASE_KEY"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Prefer",
+              "value": "return=minimal"
+            }
+          ]
+        },
+        "bodyParametersJson": "={{$json}}"
+      },
+      "id": "Supabase",
+      "name": "Save to Supabase",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1400, 300]
+    }
+  ],
+  "connections": {
+    "Cron": {
+      "main": [
+        [
+          {
+            "node": "Get Azure Token",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Azure Token": {
+      "main": [
+        [
+          {
+            "node": "Azure Cost API",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Azure Advisor API",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Azure Cost API": {
+      "main": [
+        [
+          {
+            "node": "Merge Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Azure Advisor API": {
+      "main": [
+        [
+          {
+            "node": "Merge Data",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge Data": {
+      "main": [
+        [
+          {
+            "node": "Transform Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Transform Data": {
+      "main": [
+        [
+          {
+            "node": "Save to Supabase",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}
