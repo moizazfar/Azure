@@ -1,0 +1,229 @@
+{
+  "name": "AiOps Cloud to Supabase (with Azure Advisor)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "aiops-ingest",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "node-webhook",
+      "name": "Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [100, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================\n// STEP 1: Source aur type detect karo\n// ============================================\nconst body    = $input.first().json.body || $input.first().json;\nconst headers = $input.first().json.headers || {};\n\nlet source = 'unknown';\n\n// Azure Advisor — Common Alert Schema + Recommendation eventSource\nif (\n  body.schemaId === 'azureMonitorCommonAlertSchema' &&\n  body.data?.alertContext?.eventSource === 'Recommendation' &&\n  body.data?.alertContext?.caller === 'Microsoft.Advisor'\n) {\n  source = 'azure_advisor';\n}\n// Azure Monitor (other alerts / budget)\nelse if (\n  body.schemaId === 'azureMonitorCommonAlertSchema' ||\n  body.schemaId === 'Microsoft.Insights/activityLogs' ||\n  body.data?.context?.resourceType?.toLowerCase().includes('microsoft')\n) {\n  source = 'azure';\n}\n// AWS CloudWatch / SNS\nelse if (body.Type === 'Notification' || body.TopicArn) {\n  source = 'aws';\n}\n// GCP — x-goog header ya incident field\nelse if (headers['x-goog-channel-id'] || body.incident || body.version === '1.2') {\n  source = 'gcp';\n}\n// Datadog\nelse if (body.event || body.alert_type || body.org?.id) {\n  source = 'datadog';\n}\n\nreturn [{ json: { ...body, _source: source, _rawBody: body } }];"
+      },
+      "id": "node-detect",
+      "name": "Detect Source",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [300, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================\n// STEP 2: Normalize — uniform schema banao\n// ============================================\nconst d      = $input.first().json;\nconst source = d._source;\nconst raw    = d._rawBody || d;\n\nlet normalized = { source, raw_payload: raw, data_type: 'alert' };\n\n// ─────────────────────────────────────────\n// AZURE ADVISOR\n// ─────────────────────────────────────────\nif (source === 'azure_advisor') {\n  const ess   = d.data?.essentials || {};\n  const ctx   = d.data?.alertContext || {};\n  const props = ctx.properties || {};\n\n  const resId    = (ess.alertTargetIDs || [])[0] || '';\n  const parts    = resId.split('/');\n  // /subscriptions/{sub}/resourcegroups/{rg}/providers/{ns}/{type}/{name}\n\n  normalized = {\n    source:    'azure_advisor',\n    data_type: 'recommendation',\n\n    category:            props.recommendationCategory     || '',\n    impact:              props.recommendationImpact       || '',\n    recommendation_name: props.recommendationName         || 'N/A',\n    description:         ess.description                  || '',\n    resource_link:       props.recommendationResourceLink || '',\n\n    resource_id:       resId,\n    subscription_id:   parts[2]  || '',\n    resource_group:    parts[4]  || '',\n    resource_type:     (parts[6] && parts[7]) ? parts[6]+'/'+parts[7] : '',\n    resource_name:     parts[parts.length - 1] || '',\n\n    status:          'new',\n    alert_rule_name: ess.alertRule     || '',\n    fired_at:        ess.firedDateTime || new Date().toISOString(),\n    correlation_id:  ctx.correlationId || '',\n\n    raw_payload: raw\n  };\n\n// ─────────────────────────────────────────\n// AZURE MONITOR (alerts + budget)\n// ─────────────────────────────────────────\n} else if (source === 'azure') {\n  const ctx      = d.data?.context || d.context || {};\n  const ess      = d.data?.essentials || {};\n  const isBudget = d.schemaId === 'AIP Budget Notification';\n\n  if (isBudget) {\n    normalized = {\n      ...normalized,\n      data_type:    'cost',\n      service_name: 'Azure Budget',\n      cost_usd:     parseFloat(d.data?.currentSpend?.amount || 0),\n      currency:     d.data?.currentSpend?.unit   || 'USD',\n      account_id:   d.data?.subscriptionId       || '',\n      region:       '',\n      tags:         {},\n    };\n  } else {\n    const sevRaw = (ess.severity || ctx.severity || 'Sev3').toLowerCase();\n    const sevMap = { sev0:'critical', sev1:'critical', sev2:'high', sev3:'medium', sev4:'low' };\n    normalized = {\n      ...normalized,\n      data_type:   'alert',\n      alert_id:    ess.alertId   || ctx.id     || d.id || '',\n      title:       ess.alertRule || ctx.name   || 'Azure Alert',\n      description: ess.description || d.data?.alertContext?.condition?.allOf?.[0]?.metricName || '',\n      severity:    sevMap[sevRaw] || 'medium',\n      state:       (ess.monitorCondition || d.data?.essentials?.monitorCondition || 'Fired') === 'Fired' ? 'firing' : 'resolved',\n      service:     (ctx.resourceType || '').split('/').pop() || '',\n      region:      ctx.resourceRegion || ess.configurationItems?.[0] || '',\n      tags:        {},\n    };\n  }\n\n// ─────────────────────────────────────────\n// AWS CLOUDWATCH\n// ─────────────────────────────────────────\n} else if (source === 'aws') {\n  const msg     = JSON.parse(d.Message || '{}');\n  const isCost  = !!msg.CostAndUsage;\n  const isAlert = !!msg.AlarmName;\n\n  if (isAlert) {\n    normalized = {\n      ...normalized,\n      data_type:   'alert',\n      alert_id:    msg.AlarmArn    || msg.AlarmName,\n      title:       msg.AlarmName,\n      description: msg.AlarmDescription || msg.NewStateReason || '',\n      severity:    msg.NewStateValue === 'ALARM' ? 'critical' : 'info',\n      state:       msg.NewStateValue === 'ALARM' ? 'firing'   : 'resolved',\n      service:     msg.Dimensions?.[0]?.name || 'EC2',\n      region:      msg.Region || d.TopicArn?.split(':')[3] || '',\n      tags:        { namespace: msg.Namespace },\n    };\n  } else if (isCost) {\n    const r = msg.CostAndUsage?.ResultsByTime?.[0];\n    normalized = {\n      ...normalized,\n      data_type:    'cost',\n      period_start: r?.TimePeriod?.Start,\n      period_end:   r?.TimePeriod?.End,\n      service_name: r?.Groups?.[0]?.Keys?.[0] || 'AWS',\n      account_id:   msg.accountId  || '',\n      cost_usd:     parseFloat(r?.Total?.BlendedCost?.Amount || 0),\n      currency:     r?.Total?.BlendedCost?.Unit || 'USD',\n      region:       msg.Region || '',\n      tags:         {},\n    };\n  }\n\n// ─────────────────────────────────────────\n// GCP MONITORING\n// ─────────────────────────────────────────\n} else if (source === 'gcp') {\n  const inc     = d.incident || {};\n  const isCost  = !!(d.budgetDisplayName || d.costAmount);\n\n  if (isCost) {\n    normalized = {\n      ...normalized,\n      data_type:    'cost',\n      service_name: d.budgetDisplayName || 'GCP',\n      cost_usd:     parseFloat(d.costAmount || 0),\n      currency:     d.currencyCode  || 'USD',\n      account_id:   d.budgetId      || '',\n      period_start: new Date().toISOString().split('T')[0],\n      region:       '',\n      tags:         {},\n    };\n  } else {\n    normalized = {\n      ...normalized,\n      data_type:   'alert',\n      alert_id:    inc.incident_id || inc.name || '',\n      title:       inc.condition_name || inc.policy_name || 'GCP Alert',\n      description: inc.documentation?.content || inc.summary || '',\n      severity:    (inc.severity || 'WARNING').toLowerCase(),\n      state:       inc.state === 'open' ? 'firing' : 'resolved',\n      service:     inc.resource?.type || '',\n      region:      inc.resource?.labels?.location || '',\n      tags:        inc.resource?.labels || {},\n    };\n  }\n\n// ─────────────────────────────────────────\n// DATADOG\n// ─────────────────────────────────────────\n} else if (source === 'datadog') {\n  const ev     = d.event || d;\n  const isCost = ev.title?.toLowerCase().includes('cost') ||\n                 (ev.tags || []).some(t => t.includes('budget'));\n\n  if (isCost) {\n    normalized = {\n      ...normalized,\n      data_type:    'cost',\n      service_name: 'Datadog',\n      cost_usd:     parseFloat(ev.value || 0),\n      account_id:   d.org?.id || '',\n      region:       '',\n      tags:         {},\n    };\n  } else {\n    const pri = ev.priority || 'normal';\n    normalized = {\n      ...normalized,\n      data_type:   'alert',\n      alert_id:    String(ev.id || ev.alert_id || ''),\n      title:       ev.title || ev.monitor?.name || 'Datadog Alert',\n      description: ev.text  || ev.body          || '',\n      severity:    pri === 'normal' ? (ev.alert_type === 'error' ? 'high' : 'medium') : 'critical',\n      state:       (ev.alert_type === 'success' || ev.alert_transition === 'Recovered') ? 'resolved' : 'firing',\n      service:     (ev.tags || []).find(t => t.startsWith('service:'))?.split(':')[1] || '',\n      region:      (ev.tags || []).find(t => t.startsWith('region:'))?.split(':')[1]  || '',\n      tags:        Object.fromEntries((ev.tags || []).map(t => t.split(':'))),\n    };\n  }\n}\n\nreturn [{ json: normalized }];"
+      },
+      "id": "node-normalize",
+      "name": "Normalize Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [500, 300]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": { "caseSensitive": false },
+                "conditions": [
+                  {
+                    "leftValue":  "={{ $json.data_type }}",
+                    "rightValue": "recommendation",
+                    "operator": { "type": "string", "operation": "equals" }
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey":    "advisor"
+            },
+            {
+              "conditions": {
+                "options": { "caseSensitive": false },
+                "conditions": [
+                  {
+                    "leftValue":  "={{ $json.data_type }}",
+                    "rightValue": "alert",
+                    "operator": { "type": "string", "operation": "equals" }
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey":    "alert"
+            },
+            {
+              "conditions": {
+                "options": { "caseSensitive": false },
+                "conditions": [
+                  {
+                    "leftValue":  "={{ $json.data_type }}",
+                    "rightValue": "cost",
+                    "operator": { "type": "string", "operation": "equals" }
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey":    "cost"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-switch",
+      "name": "Route by Type",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [700, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url":    "https://YOUR_SUPABASE_URL/rest/v1/aiops_advisor_recommendations",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey",        "value": "YOUR_SUPABASE_ANON_KEY" },
+            { "name": "Authorization", "value": "Bearer YOUR_SUPABASE_ANON_KEY" },
+            { "name": "Content-Type",  "value": "application/json" },
+            { "name": "Prefer",        "value": "return=representation" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ category: $json.category, impact: $json.impact, recommendation_name: $json.recommendation_name, description: $json.description, resource_link: $json.resource_link, resource_id: $json.resource_id, subscription_id: $json.subscription_id, resource_group: $json.resource_group, resource_type: $json.resource_type, resource_name: $json.resource_name, status: $json.status, alert_rule_name: $json.alert_rule_name, fired_at: $json.fired_at, correlation_id: $json.correlation_id, raw_payload: $json.raw_payload }) }}"
+      },
+      "id": "node-save-advisor",
+      "name": "Save Advisor Rec",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [920, 120]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url":    "https://YOUR_SUPABASE_URL/rest/v1/aiops_alerts",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey",        "value": "YOUR_SUPABASE_ANON_KEY" },
+            { "name": "Authorization", "value": "Bearer YOUR_SUPABASE_ANON_KEY" },
+            { "name": "Content-Type",  "value": "application/json" },
+            { "name": "Prefer",        "value": "return=representation" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ source: $json.source, alert_id: $json.alert_id, severity: $json.severity, state: $json.state, title: $json.title, description: $json.description, service: $json.service, region: $json.region, tags: $json.tags, raw_payload: $json.raw_payload }) }}"
+      },
+      "id": "node-save-alert",
+      "name": "Save Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [920, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url":    "https://YOUR_SUPABASE_URL/rest/v1/aiops_cost_data",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey",        "value": "YOUR_SUPABASE_ANON_KEY" },
+            { "name": "Authorization", "value": "Bearer YOUR_SUPABASE_ANON_KEY" },
+            { "name": "Content-Type",  "value": "application/json" },
+            { "name": "Prefer",        "value": "return=representation" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ source: $json.source, service_name: $json.service_name, account_id: $json.account_id, region: $json.region, cost_usd: $json.cost_usd, currency: $json.currency || 'USD', period_start: $json.period_start, period_end: $json.period_end, tags: $json.tags || {}, raw_payload: $json.raw_payload }) }}"
+      },
+      "id": "node-save-cost",
+      "name": "Save Cost",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [920, 480]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ success: true, type: 'recommendation', id: $json[0]?.id, category: $('Normalize Data').item.json.category, impact: $('Normalize Data').item.json.impact }) }}"
+      },
+      "id": "node-resp-advisor",
+      "name": "Respond Advisor OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1140, 120]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ success: true, type: 'alert', id: $json[0]?.id, source: $('Normalize Data').item.json.source }) }}"
+      },
+      "id": "node-resp-alert",
+      "name": "Respond Alert OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1140, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ success: true, type: 'cost', id: $json[0]?.id, source: $('Normalize Data').item.json.source }) }}"
+      },
+      "id": "node-resp-cost",
+      "name": "Respond Cost OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1140, 480]
+    }
+  ],
+  "connections": {
+    "Webhook Trigger": {
+      "main": [[{ "node": "Detect Source",   "type": "main", "index": 0 }]]
+    },
+    "Detect Source": {
+      "main": [[{ "node": "Normalize Data",  "type": "main", "index": 0 }]]
+    },
+    "Normalize Data": {
+      "main": [[{ "node": "Route by Type",   "type": "main", "index": 0 }]]
+    },
+    "Route by Type": {
+      "main": [
+        [{ "node": "Save Advisor Rec", "type": "main", "index": 0 }],
+        [{ "node": "Save Alert",       "type": "main", "index": 0 }],
+        [{ "node": "Save Cost",        "type": "main", "index": 0 }]
+      ]
+    },
+    "Save Advisor Rec": {
+      "main": [[{ "node": "Respond Advisor OK", "type": "main", "index": 0 }]]
+    },
+    "Save Alert": {
+      "main": [[{ "node": "Respond Alert OK",   "type": "main", "index": 0 }]]
+    },
+    "Save Cost": {
+      "main": [[{ "node": "Respond Cost OK",    "type": "main", "index": 0 }]]
+    }
+  }
+}
