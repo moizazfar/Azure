@@ -1,0 +1,223 @@
+{
+  "name": "finops_cost",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "triggerAtHour": 1,
+              "triggerAtMinute": 0
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [-600, 0],
+      "id": "2494a5a5-eb18-442b-addf-f2078c4caacs",
+      "name": "Schedule Trigger"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ================================================\n// Dynamic blob path — har mahine auto update hoga\n// Azure Export folder: YYYYMMDD-YYYYMMDD/{uuid}/parte_cont.csv\n// ================================================\nconst now   = new Date();\nconst year  = now.getUTCFullYear();\nconst month = now.getUTCMonth();\n\nconst firstDay = new Date(Date.UTC(year, month, 1));\nconst lastDay  = new Date(Date.UTC(year, month + 1, 0));\n\nconst pad = n => String(n).padStart(2, '0');\nconst fmt = d => `${d.getUTCFullYear()}${pad(d.getUTCMonth()+1)}${pad(d.getUTCDate())}`;\n\nconst folderRange = `${fmt(firstDay)}-${fmt(lastDay)}`;\n\n// Aapka Azure export UUID — agar export recreate karo toh yahan update karo\nconst EXPORT_UUID = '2647842c-fd21-4999-abta-a3ff4b3eb84f';\n\nconst blobPath = `finops/finops-export-daily-finopsexport/${folderRange}/${EXPORT_UUID}/parte_cont.csv`;\n\nconsole.log(`[FinOps] Blob path: ${blobPath}`);\nconsole.log(`[FinOps] Run date: ${now.toISOString()}`);\n\nreturn [{\n  json: { blobPath, folderRange, runDate: now.toISOString() }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-380, 0],
+      "id": "node-build-path",
+      "name": "Build Dynamic Path"
+    },
+    {
+      "parameters": {
+        "resource": "blob",
+        "operation": "get",
+        "container": {
+          "mode": "list",
+          "value": "myfinopsexport"
+        },
+        "blob": {
+          "mode": "id",
+          "value": "={{ $json.blobPath }}"
+        },
+        "options": {
+          "simplify": false
+        }
+      },
+      "type": "n8n-nodes-base.azureStorage",
+      "typeVersion": 1,
+      "position": [-160, 0],
+      "id": "199eb356-2592-4f70-bf91-4119b4c9672d",
+      "name": "Get blob",
+      "credentials": {
+        "azureStorageSharedKeyApi": {
+          "id": "QCbverBeZHkP1Lkr",
+          "name": "Azure Storage account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "csv",
+        "options": {
+          "delimiter": ",",
+          "headerRow": true,
+          "relaxColumnCount": true
+        }
+      },
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1,
+      "position": [60, 0],
+      "id": "a1446ce0-5e6d-4d50-ba3f-a03d5916e40f",
+      "name": "Extract from File"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ================================================\n// Clean + Validate + Type cast\n// ================================================\nconst items   = $input.all();\nconst cleaned = [];\nlet   skipped = 0;\n\nfor (const item of items) {\n  const r = item.json;\n\n  if (!r.SubscriptionGuid || !r.UsageDateTime) { skipped++; continue; }\n\n  let usageDate = '';\n  try {\n    usageDate = new Date(r.UsageDateTime).toISOString().split('T')[0];\n  } catch(e) {\n    usageDate = String(r.UsageDateTime || '').split('T')[0].trim();\n  }\n  if (!usageDate || usageDate.startsWith('Invalid')) { skipped++; continue; }\n\n  const safeNum    = v => { const n = parseFloat(String(v||'0').replace(/,/g,'').trim()); return isNaN(n) ? 0 : n; };\n  const nullIfEmpty = v => { const s = String(v||'').trim(); return s==='' ? null : s; };\n\n  cleaned.push({ json: {\n    subscription_guid: String(r.SubscriptionGuid||'').trim().toLowerCase(),\n    resource_group:    nullIfEmpty(r.ResourceGroup),\n    resource_location: nullIfEmpty(r.ResourceLocation),\n    usage_date:        usageDate,\n    meter_category:    nullIfEmpty(r.MeterCategory),\n    meter_id:          nullIfEmpty(r.MeterId),\n    meter_name:        nullIfEmpty(r.MeterName),\n    usage_quantity:    safeNum(r.UsageQuantity),\n    resource_rate:     safeNum(r.ResourceRate),\n    pre_tax_cost:      safeNum(r.PreTaxCost),\n    consumed_service:  nullIfEmpty(r.ConsumedService),\n    resource_type:     nullIfEmpty(r.ResourceType),\n    instance_id:       nullIfEmpty(r.InstanceId),\n    offer_id:          nullIfEmpty(r.OfferId),\n    service_name:      nullIfEmpty(r.ServiceName),\n    service_tier:      nullIfEmpty(r.ServiceTier),\n    currency:          nullIfEmpty(r.Currency) || 'USD'\n  }});\n}\n\nif (cleaned.length === 0) {\n  throw new Error(`[FinOps] Koi valid row nahi mili. Total: ${items.length}, Skipped: ${skipped}`);\n}\nconsole.log(`[FinOps] Clean done — Valid: ${cleaned.length}, Skipped: ${skipped}`);\nreturn cleaned;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [280, 0],
+      "id": "node-clean",
+      "name": "Clean & Validate"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ================================================\n// Sirf latest UsageDate ki rows rakho\n// CSV mein poora month-to-date data hota hai\n// ================================================\nconst items = $input.all();\nif (items.length === 0) return [];\n\nconst latestDate = items.reduce((max, item) => {\n  const d = item.json.usage_date || '';\n  return d > max ? d : max;\n}, '');\n\nif (!latestDate) throw new Error('[FinOps] usage_date nahi mili');\n\nconst latest = items.filter(i => i.json.usage_date === latestDate);\nconsole.log(`[FinOps] Latest date: ${latestDate} — ${latest.length} rows`);\n\nreturn latest.map(i => ({ json: { ...i.json, _latestDate: latestDate } }));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [500, 0],
+      "id": "30210934-24d3-4235-8dc4-4b7c425876ce",
+      "name": "Filter Latest Date"
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "tableId": "azure_cost_data",
+        "returnAll": false,
+        "limit": 1,
+        "filterType": "manual",
+        "filtersUi": {
+          "values": [
+            {
+              "fieldId": "usage_date",
+              "condition": "eq",
+              "fieldValue": "={{ $json._latestDate }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [720, 0],
+      "id": "node-check-dup",
+      "name": "Check Duplicate Date",
+      "credentials": {
+        "supabaseApi": {
+          "id": "pcNOz4FWoKw5344M",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": false },
+          "conditions": [
+            {
+              "leftValue": "={{ $input.all().length }}",
+              "rightValue": 0,
+              "operator": { "type": "number", "operation": "equals" }
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [940, 0],
+      "id": "node-if-new",
+      "name": "Is New Data?"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ================================================\n// 500 rows ke batches banao — Supabase bulk limit\n// ================================================\nconst items      = $('Filter Latest Date').all();\nconst BATCH_SIZE = 500;\nconst batches    = [];\n\nfor (let i = 0; i < items.length; i += BATCH_SIZE) {\n  const batch = items.slice(i, i + BATCH_SIZE).map(item => {\n    const row = { ...item.json };\n    delete row._latestDate;\n    return row;\n  });\n  batches.push({ json: {\n    rows:         batch,\n    batchNum:     Math.floor(i / BATCH_SIZE) + 1,\n    totalBatches: Math.ceil(items.length / BATCH_SIZE),\n    rowCount:     batch.length\n  }});\n}\n\nconsole.log(`[FinOps] ${batches.length} batches, ${items.length} total rows ready`);\nreturn batches;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1160, -140],
+      "id": "node-batch",
+      "name": "Prepare Batches"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $credentials.host }}/rest/v1/azure_cost_data",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "supabaseApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Prefer",
+              "value": "resolution=ignore-duplicates,return=minimal"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.rows) }}"
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1380, -140],
+      "id": "node-upsert",
+      "name": "Batch Insert to Supabase",
+      "credentials": {
+        "supabaseApi": {
+          "id": "pcNOz4FWoKw5344M",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const date      = $('Filter Latest Date').first().json._latestDate;\nconst totalRows = $('Filter Latest Date').all().length;\nconsole.log(`[FinOps] SKIP — ${date} ka data (${totalRows} rows) already Supabase mein hai`);\nreturn [{ json: { status: 'skipped', date, totalRows, reason: 'Already ingested' } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1160, 120],
+      "id": "node-skip",
+      "name": "Skip — Already Ingested"
+    }
+  ],
+  "connections": {
+    "Schedule Trigger":     { "main": [[{ "node": "Build Dynamic Path",      "type": "main", "index": 0 }]] },
+    "Build Dynamic Path":   { "main": [[{ "node": "Get blob",                "type": "main", "index": 0 }]] },
+    "Get blob":             { "main": [[{ "node": "Extract from File",        "type": "main", "index": 0 }]] },
+    "Extract from File":    { "main": [[{ "node": "Clean & Validate",         "type": "main", "index": 0 }]] },
+    "Clean & Validate":     { "main": [[{ "node": "Filter Latest Date",       "type": "main", "index": 0 }]] },
+    "Filter Latest Date":   { "main": [[{ "node": "Check Duplicate Date",     "type": "main", "index": 0 }]] },
+    "Check Duplicate Date": { "main": [[{ "node": "Is New Data?",             "type": "main", "index": 0 }]] },
+    "Is New Data?": {
+      "main": [
+        [{ "node": "Prepare Batches",         "type": "main", "index": 0 }],
+        [{ "node": "Skip — Already Ingested", "type": "main", "index": 0 }]
+      ]
+    },
+    "Prepare Batches": { "main": [[{ "node": "Batch Insert to Supabase", "type": "main", "index": 0 }]] }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryDataMode": "separate"
+  },
+  "versionId": "9baee0ad-a767-4c69-8700-99d0ab69f63f",
+  "id": "1PKq57pe9pdkIFUr",
+  "tags": []
+}
